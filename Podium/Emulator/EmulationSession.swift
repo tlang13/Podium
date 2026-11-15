@@ -35,27 +35,13 @@ final class EmulationSession {
         let storageFlushed: Bool
     }
 
-    /// `_panic` and the unexported `panic_context` (reached from exception
-    /// handlers, jumping into `_panic`'s tail) in the 10B500 kernelcache,
-    /// with the register holding each one's format string.
-    private static let panicEntries: [UInt32: Int] = [0x8001_7C10: 0, 0x8001_7F28: 2]
-    /// `boot(paniced, howto, command)` in the same kernelcache, where every
-    /// shutdown and restart begins once launchd asks for one; `howto` bit 3
-    /// (`RB_HALT`) tells a shutdown from a restart. The run ends there:
-    /// everything the kernel does after it — syncing and unmounting a root
-    /// filesystem whose changes are discarded at power-off anyway, telling
-    /// every driver — only takes time. A lot of it: by then the root
-    /// filesystem's cached pages are going, and a launchd thread that
-    /// wakes up faults on its own code, takes the signal, faults again in
-    /// the handler, and crowds out the halt for a minute or more.
-    private static let shutdownEntry: UInt32 = 0x801D_F6E8
-    /// `shared_region_map_and_slide_np` (syscall 438, from `sysent`), which
-    /// launchd's dyld calls once, early, to map the dyld shared cache: the
-    /// slide it picked is the fourth word of the arguments (`r1 + 0xc`),
-    /// and QuartzCoreAcceleration needs it.
-    private static let sharedRegionEntry: UInt32 = 0x8021_DC94
+    /// The kernelcache-specific entry points this session watches (panic,
+    /// shutdown, shared-region mapping) live in `KernelProfile`; they are
+    /// addresses in one exact kernelcache build, so they travel with it.
     private static let haltFlag: UInt32 = 1 << 3
 
+    /// Which kernelcache build this machine is running; see `KernelProfile`.
+    let profile: KernelProfile
     let cpu: ARMv7CPU
     let platform: S5L8930XPlatform
     let display: DisplayScanout
@@ -94,7 +80,9 @@ final class EmulationSession {
 
     /// `persistent`: the guest's writes to its root filesystem go to the
     /// image file, and last; otherwise every boot starts from the image.
-    init(kernel: Data, deviceTree: Data, rootFilesystem: URL, persistent: Bool = false) throws {
+    init(kernel: Data, deviceTree: Data, rootFilesystem: URL, persistent: Bool = false,
+         profile: KernelProfile = .iPodTouch4_10B500) throws {
+        self.profile = profile
         ram = FlatPhysicalMemory(length: GuestMemoryLayout.ramSize, baseAddress: GuestMemoryLayout.ramPhysicalBase)
         persistentRootFilesystem = persistent
         // A small on-chip SRAM at low physical addresses, separate from
@@ -127,12 +115,12 @@ final class EmulationSession {
         }
         cpu.reset()
         cpu.loadInitialRegisters(prepared.initialRegisters)
-        cpu.breakpoints = Set(Self.panicEntries.keys).union([Self.shutdownEntry, Self.sharedRegionEntry])
+        cpu.breakpoints = Set(profile.panicEntries.keys).union([profile.shutdownEntry, profile.sharedRegionEntry])
         // Translated code wherever this process may run generated code (on
         // iOS, once a debugger such as StikDebug has prepared memory for
         // it); the interpreter otherwise.
         cpu.dbt = DBTEngine(cpu: cpu)
-        KernelAcceleration.install(on: cpu)
+        KernelAcceleration.install(on: cpu, timebaseReadLoop: profile.timebaseReadLoop)
         // A reset by any other route (the kernel ends a halt with the
         // watchdog, and spins until it lands) ends the run too; the run
         // loop sees it at the end of the chunk.
@@ -378,19 +366,19 @@ final class EmulationSession {
                 finalState = .shutDown
                 break
             }
-            if cpu.hitBreakpoint == Self.sharedRegionEntry {
-                cpu.breakpoints.remove(Self.sharedRegionEntry)
+            if cpu.hitBreakpoint == profile.sharedRegionEntry {
+                cpu.breakpoints.remove(profile.sharedRegionEntry)
                 if let arguments = cpu.hostAddress(ofVirtual: cpu.registers[1] &+ 0xC, for: .read) {
                     sharedCacheSlide = arguments.load(as: UInt32.self)
                     QuartzCoreAcceleration.install(on: cpu, sharedCacheSlide: arguments.load(as: UInt32.self))
                 }
                 continue
             }
-            if cpu.hitBreakpoint == Self.shutdownEntry {
+            if cpu.hitBreakpoint == profile.shutdownEntry {
                 finalState = cpu.registers[1] & Self.haltFlag != 0 ? .shutDown : .restarting
                 break
             }
-            if let hit = cpu.hitBreakpoint, let register = Self.panicEntries[hit] {
+            if let hit = cpu.hitBreakpoint, let register = profile.panicEntries[hit] {
                 let format = cpu.registers[register]
                 finalState = .panicked(readCString(atKernelVirtual: format))
                 break

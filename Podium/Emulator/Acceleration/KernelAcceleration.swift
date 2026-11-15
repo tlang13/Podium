@@ -6,14 +6,15 @@ import Foundation
 /// it's meant to replace the first time it runs, and a mismatch leaves
 /// the kernel's own.
 enum KernelAcceleration {
-    static func install(on cpu: ARMv7CPU) {
-        guard let dbt = cpu.dbt else { return }
+    /// `timebaseReadLoop` is where this kernelcache build keeps that loop (see
+    /// `KernelProfile`); `nil` installs nothing, leaving the kernel's own.
+    static func install(on cpu: ARMv7CPU, timebaseReadLoop: UInt32?) {
+        guard let dbt = cpu.dbt, let readLoop = timebaseReadLoop else { return }
         // `mach_absolute_time`'s read of the timebase: high word, low
         // word, high word again until the two highs agree. Called tens of
         // thousands of times a second while the UI animates, and each
         // read is of a device, which translated code leaves to the
         // interpreter one instruction at a time.
-        let readLoop: UInt32 = 0x8008_9608
         let expected: [UInt32] = [0xE59C_1004, 0xE59C_0000, 0xE59C_2004, 0xE151_0002, 0x1AFF_FFFA]
         var verified: Bool?
         dbt.registerSnippet(at: readLoop, thumb: false, exit: readLoop &+ UInt32(expected.count * 4)) { cpu in
